@@ -1,0 +1,211 @@
+"""
+Model exported as python.
+Name : DelimitandoCuenca4
+Group : 
+With QGIS : 33601
+"""
+
+from qgis.core import QgsProcessing
+from qgis.core import QgsProcessingAlgorithm
+from qgis.core import QgsProcessingMultiStepFeedback
+from qgis.core import QgsProcessingParameterRasterLayer
+from qgis.core import QgsProcessingParameterNumber
+from qgis.core import QgsProcessingParameterRasterDestination
+from qgis.core import QgsProcessingParameterFeatureSink
+import processing
+
+
+class Delimitandocuenca4(QgsProcessingAlgorithm):
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterRasterLayer('DEMHidrolgico', 'DEM', defaultValue=None))
+        self.addParameter(QgsProcessingParameterNumber('Este', 'Este', type=QgsProcessingParameterNumber.Double, minValue=-1.79769e+308, maxValue=1.79769e+308, defaultValue=None))
+        self.addParameter(QgsProcessingParameterNumber('Norte', 'Norte', type=QgsProcessingParameterNumber.Double, defaultValue=None))
+        self.addParameter(QgsProcessingParameterNumber('UmbralCalibracin', 'Umbral Orden Rio', type=QgsProcessingParameterNumber.Integer, minValue=1, maxValue=20, defaultValue=5))
+        self.addParameter(QgsProcessingParameterRasterDestination('DemCuenca', 'DEM Cuenca', createByDefault=True, defaultValue=None))
+        self.addParameter(QgsProcessingParameterFeatureSink('RedHidrica', 'Red Hidrica', type=QgsProcessing.TypeVectorAnyGeometry, createByDefault=True, defaultValue='TEMPORARY_OUTPUT'))
+        self.addParameter(QgsProcessingParameterFeatureSink('CuencaHidrografica', 'Cuenca Hidrografica', type=QgsProcessing.TypeVectorAnyGeometry, createByDefault=True, supportsAppend=True, defaultValue=None))
+
+    def processAlgorithm(self, parameters, context, model_feedback):
+        # Use a multi-step feedback, so that individual child algorithm progress reports are adjusted for the
+        # overall progress through the model
+        feedback = QgsProcessingMultiStepFeedback(10, model_feedback)
+        results = {}
+        outputs = {}
+
+        # Fill sinks (wang & liu)_DEM
+        alg_params = {
+            'ELEV': parameters['DEMHidrolgico'],
+            'MINSLOPE': 0.1,
+            'FDIR': QgsProcessing.TEMPORARY_OUTPUT,
+            'FILLED': QgsProcessing.TEMPORARY_OUTPUT,
+            'WSHED': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['FillSinksWangLiu_dem'] = processing.run('sagang:fillsinkswangliu', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(1)
+        if feedback.isCanceled():
+            return {}
+
+        # Upslope area_DEM
+        alg_params = {
+            'CONVERGE': 1.1,
+            'ELEVATION': outputs['FillSinksWangLiu_dem']['FILLED'],
+            'METHOD': 0,  # [0] Deterministic 8
+            'MFD_CONTOUR': False,
+            'SINKROUTE': None,
+            'TARGET': None,
+            'TARGET_PT_X': parameters['Este'],
+            'TARGET_PT_Y': parameters['Norte'],
+            'AREA': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['UpslopeArea_dem'] = processing.run('sagang:upslopearea', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(2)
+        if feedback.isCanceled():
+            return {}
+
+        # Channel network and drainage basins
+        alg_params = {
+            'DEM': outputs['FillSinksWangLiu_dem']['FILLED'],
+            'SUBBASINS': True,
+            'THRESHOLD': parameters['UmbralCalibracin'],
+            'BASINS': QgsProcessing.TEMPORARY_OUTPUT,
+            'SEGMENTS': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['ChannelNetworkAndDrainageBasins'] = processing.run('sagang:channelnetworkanddrainagebasins', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(3)
+        if feedback.isCanceled():
+            return {}
+
+        # Polygonize (raster to vector)_Cuenca
+        alg_params = {
+            'BAND': 1,
+            'EIGHT_CONNECTEDNESS': False,
+            'EXTRA': None,
+            'FIELD': 'Valor',
+            'INPUT': outputs['UpslopeArea_dem']['AREA'],
+            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['PolygonizeRasterToVector_cuenca'] = processing.run('gdal:polygonize', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(4)
+        if feedback.isCanceled():
+            return {}
+
+        # Extract by attribute_Cuenca
+        alg_params = {
+            'FIELD': 'Valor',
+            'INPUT': outputs['PolygonizeRasterToVector_cuenca']['OUTPUT'],
+            'OPERATOR': 0,  # =
+            'VALUE': '100',
+            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['ExtractByAttribute_cuenca'] = processing.run('native:extractbyattribute', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(5)
+        if feedback.isCanceled():
+            return {}
+
+        # Buffer_Cuenca
+        alg_params = {
+            'DISSOLVE': False,
+            'DISTANCE': 0,
+            'END_CAP_STYLE': 0,  # Round
+            'INPUT': outputs['ExtractByAttribute_cuenca']['OUTPUT'],
+            'JOIN_STYLE': 0,  # Round
+            'MITER_LIMIT': 2,
+            'SEGMENTS': 5,
+            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['Buffer_cuenca'] = processing.run('native:buffer', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(6)
+        if feedback.isCanceled():
+            return {}
+
+        # Field calculator_area
+        alg_params = {
+            'FIELD_LENGTH': 20,
+            'FIELD_NAME': 'Area_km2',
+            'FIELD_PRECISION': 2,
+            'FIELD_TYPE': 0,  # Decimal (double)
+            'FORMULA': ' $area  / 1000000',
+            'INPUT': outputs['Buffer_cuenca']['OUTPUT'],
+            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['FieldCalculator_area'] = processing.run('native:fieldcalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+
+        feedback.setCurrentStep(7)
+        if feedback.isCanceled():
+            return {}
+
+        # Clip
+        alg_params = {
+            'INPUT': outputs['ChannelNetworkAndDrainageBasins']['SEGMENTS'],
+            'OVERLAY': outputs['Buffer_cuenca']['OUTPUT'],
+            'OUTPUT': parameters['RedHidrica']
+        }
+        outputs['Clip'] = processing.run('native:clip', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        results['RedHidrica'] = outputs['Clip']['OUTPUT']
+
+        feedback.setCurrentStep(8)
+        if feedback.isCanceled():
+            return {}
+
+        # Field calculator_Perimetro
+        alg_params = {
+            'FIELD_LENGTH': 20,
+            'FIELD_NAME': 'Perimetro_m',
+            'FIELD_PRECISION': 2,
+            'FIELD_TYPE': 0,  # Decimal (double)
+            'FORMULA': ' $perimeter ',
+            'INPUT': outputs['FieldCalculator_area']['OUTPUT'],
+            'OUTPUT': parameters['CuencaHidrografica']
+        }
+        outputs['FieldCalculator_perimetro'] = processing.run('native:fieldcalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        results['CuencaHidrografica'] = outputs['FieldCalculator_perimetro']['OUTPUT']
+
+        feedback.setCurrentStep(9)
+        if feedback.isCanceled():
+            return {}
+
+        # Clip raster by mask layer_DEM
+        alg_params = {
+            'ALPHA_BAND': False,
+            'CROP_TO_CUTLINE': True,
+            'DATA_TYPE': 0,  # Use Input Layer Data Type
+            'EXTRA': None,
+            'INPUT': outputs['FillSinksWangLiu_dem']['FILLED'],
+            'KEEP_RESOLUTION': False,
+            'MASK': outputs['Buffer_cuenca']['OUTPUT'],
+            'MULTITHREADING': False,
+            'NODATA': None,
+            'OPTIONS': None,
+            'SET_RESOLUTION': False,
+            'SOURCE_CRS': None,
+            'TARGET_CRS': None,
+            'TARGET_EXTENT': None,
+            'X_RESOLUTION': None,
+            'Y_RESOLUTION': None,
+            'OUTPUT': parameters['DemCuenca']
+        }
+        outputs['ClipRasterByMaskLayer_dem'] = processing.run('gdal:cliprasterbymasklayer', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        results['DemCuenca'] = outputs['ClipRasterByMaskLayer_dem']['OUTPUT']
+        return results
+
+    def name(self):
+        return 'DelimitandoCuenca4'
+
+    def displayName(self):
+        return 'DelimitandoCuenca4'
+
+    def group(self):
+        return ''
+
+    def groupId(self):
+        return ''
+
+    def createInstance(self):
+        return Delimitandocuenca4()
